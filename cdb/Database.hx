@@ -77,7 +77,7 @@ class Database {
 		return smap.get(name);
 	}
 
-	public function createSheet( name : String ) {
+	public function createSheet( name : String, ?index : Int ) {
 		// name already exists
 		for( s in sheets )
 			if( s.name == name )
@@ -90,27 +90,70 @@ class Database {
 			props : {
 			},
 		};
-		return addSheet(s);
+		return addSheet(s, index);
 	}
 
-	function addSheet( s : cdb.Data.SheetData ) : Sheet {
+	public function moveSheet( s : Sheet, delta : Int ) {
+		var fsheets = [for( s in sheets ) if( !s.props.hide ) s];
+		var index = fsheets.indexOf(s);
+		var other = fsheets[index+delta];
+		if( index < 0 || other == null ) return false;
+
+		// move to new index
+		sheets.remove(s);
+		index = sheets.indexOf(other);
+		if( delta > 0 ) index++;
+		sheets.insert(index, s);
+
+		// move sub sheets as well !
+		var moved = [s];
+		var delta = 0;
+		for( ssub in sheets.copy() ) {
+			var parent = ssub.getParent();
+			if( parent != null && moved.indexOf(parent.s) >= 0 ) {
+				sheets.remove(ssub);
+				var idx = sheets.indexOf(s) + (++delta);
+				sheets.insert(idx, ssub);
+				moved.push(ssub);
+			}
+		}
+		updateSheets();
+		return true;
+	}
+
+	function addSheet( s : cdb.Data.SheetData, ?index : Int ) : Sheet {
 		var sobj = new Sheet(this, s);
-		data.sheets.push(s);
+		if( index != null )
+			data.sheets.insert(index, s);
+		else
+			data.sheets.push(s);
 		sobj.sync();
-		sheets.push(sobj);
+		if( index != null )
+			sheets.insert(index, sobj);
+		else
+			sheets.push(sobj);
 		return sobj;
 	}
 
-	public function createSubSheet( s : Sheet, c : Column ) {
+	public function createSubSheet( parent : Sheet, c : Column ) {
 		var s : cdb.Data.SheetData = {
-			name : s.name + "@" + c.name,
+			name : parent.name + "@" + c.name,
 			props : { hide : true },
 			separators : [],
 			lines : [],
 			columns : [],
 		};
 		if( c.type == TProperties ) s.props.isProps = true;
-		return addSheet(s);
+		// our parent might be a virtual sheet
+		var index = data.sheets.indexOf(Lambda.find(data.sheets, function(s) return s.name == parent.name));
+		for( c2 in parent.columns ) {
+			if( c == c2 ) break;
+			if( c2.type.match(TProperties|TList) ) {
+				var sub = parent.getSub(c2);
+				index = data.sheets.indexOf(@:privateAccess sub.sheet);
+			}
+		}
+		return addSheet(s, index < 0 ? null : index + 1);
 	}
 
 	public function sync() {
@@ -127,8 +170,22 @@ class Database {
 	}
 
 	public function load( content : String ) {
-		data = cdb.Parser.parse(content, true);
+		var data = cdb.Parser.parse(content, true);
+		loadData(data);
+	}
+
+	public function loadData( data : cdb.Data ) {
+		this.data = data;
+		if( sheets != null ) {
+			// reset old sheets (should not be used)
+			for( s in sheets ) @:privateAccess {
+				s.base = null;
+				s.index = null;
+				s.sheet = null;
+			}
+		}
 		sheets = [for( s in data.sheets ) new Sheet(this, s)];
+		#if cdb_old_compat
 		for( s in sheets )
 			if( s.props.hasIndex ) {
 				// delete old index data, if present
@@ -136,6 +193,7 @@ class Database {
 				for( i in 0...lines.length )
 					Reflect.deleteField(lines[i],"index");
 			}
+		#end
 		sync();
 	}
 
@@ -183,24 +241,27 @@ class Database {
 				var lines = s.getLines();
 				var gid = 0;
 				var sindex = 0;
-				var titles = s.props.separatorTitles;
-				if( titles != null ) {
-					// skip first if at head
-					while( s.separators[sindex] == 0 && titles[sindex] != null ) sindex++;
-					for( i in 0...lines.length ) {
-						while( s.separators[sindex] == i ) {
-							if( titles[sindex] != null ) gid++;
-							sindex++;
-						}
-						lines[i].group = gid;
+				// skip first if at head
+				while( true ) {
+					var s = s.separators[sindex];
+					if( s == null || s.index != 0 || s.title == null ) break;
+					sindex++;
+				}
+				for( i in 0...lines.length ) {
+					while( true ) {
+						var s = s.separators[sindex];
+						if( s == null || s.index != i ) break;
+						if( s.title != null ) gid++;
+						sindex++;
 					}
+					lines[i].group = gid;
 				}
 			}
 		}
 		return cdb.Parser.save(data);
 	}
 
-	public function getDefault( c : Column, ignoreOpt = false ) : Dynamic {
+	public function getDefault( c : Column, ?ignoreOpt = false, ?sheet : Sheet ) : Dynamic {
 		if( c.opt && !ignoreOpt )
 			return null;
 		return switch( c.type ) {
@@ -219,7 +280,17 @@ class Database {
 			id;
 		case TBool: c.opt ? true : false;
 		case TList: [];
-		case TProperties : {};
+		case TProperties:
+			var obj = {};
+			if( sheet != null ) {
+				var s = sheet.getSub(c);
+				for( c in s.columns )
+					if( !c.opt ) {
+						var def = getDefault(c, s);
+						if( def != null ) Reflect.setField(obj, c.name, def);
+					}
+			}
+			obj;
 		case TCustom(_), TTilePos, TTileLayer, TDynamic: null;
 		}
 	}
@@ -248,16 +319,21 @@ class Database {
 				if( v != null )
 					Reflect.setField(o, c.name, v);
 			}
-
-			function renameRec(sheet:Sheet, col) {
+			var renames = [];
+			function renameRec(sheet:Sheet, col, newName) {
 				var s = sheet.getSub(col);
-				s.rename(sheet.name + "@" + c.name);
+				renames.push(function() {
+					s.rename(sheet.name + "@" + newName);
+					s.sync();
+				});
 				for( c in s.columns )
 					if( c.type == TList || c.type == TProperties )
-						renameRec(s, c);
-				s.sync();
+						renameRec(s, c, c.name);
 			}
-			if( old.type == TList || old.type == TProperties ) renameRec(sheet, old);
+			if( old.type == TList || old.type == TProperties ) {
+				renameRec(sheet, old, c.name);
+				for( f in renames ) f();
+			}
 			old.name = c.name;
 		}
 
@@ -283,7 +359,7 @@ class Database {
 				for( o in sheet.getLines() ) {
 					var v = Reflect.field(o, c.name);
 					if( v == null ) {
-						v = getDefault(c);
+						v = getDefault(c, sheet);
 						if( v != null ) Reflect.setField(o, c.name, v);
 					}
 				}
@@ -292,7 +368,7 @@ class Database {
 				case TEnum(_):
 					// first choice should not be removed
 				default:
-					var def = getDefault(old);
+					var def = getDefault(old, sheet);
 					for( o in sheet.getLines() ) {
 						var v = Reflect.field(o, c.name);
 						switch( c.type ) {
@@ -301,7 +377,7 @@ class Database {
 							if( v.length == 0 )
 								Reflect.deleteField(o, c.name);
 						case TProperties:
-							if( Reflect.fields(v).length == 0 )
+							if( Reflect.fields(v).length == 0 || haxe.Json.stringify(v) == haxe.Json.stringify(def) )
 								Reflect.deleteField(o, c.name);
 						default:
 							if( v == def )
@@ -313,15 +389,13 @@ class Database {
 			old.opt = c.opt;
 		}
 
-		if( c.display == null )
-			Reflect.deleteField(old,"display");
-		else
-			old.display = c.display;
-
-		if( c.kind == null )
-			Reflect.deleteField(old,"kind");
-		else
-			old.kind = c.kind;
+		for( f in ["display","kind","scope","documentation", "editor"] ) {
+			var v : Dynamic = Reflect.field(c,f);
+			if( v == null )
+				Reflect.deleteField(old, f);
+			else
+				Reflect.setField(old,f,v);
+		}
 
 		sheet.sync();
 		return null;
@@ -394,6 +468,8 @@ class Database {
 				map[p.a.i] = p.b.i;
 			}
 			conv = function(i) return map[i];
+		case [TEnum(values), TString]:
+			conv = function(i) return values[i];
 		case [TFlags(values1), TFlags(values2)]:
 			var map : Array<Null<Int>> = [];
 			for( p in makePairs([for( i in 0...values1.length ) { name : values1[i], i : i } ], [for( i in 0...values2.length ) { name : values2[i], i : i } ]) ) {
@@ -434,7 +510,36 @@ class Database {
 		var casesPairs = makePairs(old.cases, t.cases);
 
 		// build convert map
-		var convMap = [];
+		var convMap : Array<{ def : Array<Dynamic>, args : Array<Dynamic -> Dynamic> }> = [];
+
+		function convertTypeRec( t : CustomType, v : Array<Dynamic> ) : Array<Dynamic> {
+			if( t == null || v == null )
+				return null;
+			var c = t.cases[v[0]];
+			for( i in 0...c.args.length ) {
+				switch( c.args[i].type ) {
+				case TCustom(tname):
+					var av = v[i + 1];
+					if( av != null )
+						v[i+1] = convertTypeRec(getCustomType(tname), av);
+				default:
+				}
+			}
+			if( t == old ) {
+				var conv = convMap[v[0]];
+				if( conv == null )
+					return null;
+				var out = conv.def.copy();
+				for( i in 0...conv.args.length ) {
+					var v = conv.args[i](v[i + 1]);
+					if( v == null ) continue;
+					out[v.index+1] = v.v;
+				}
+				return out;
+			}
+			return v;
+		}
+
 		for( p in casesPairs ) {
 
 			if( p.b == null ) continue;
@@ -473,34 +578,6 @@ class Database {
 			while( conv.def[conv.def.length - 1] == null )
 				conv.def.pop();
 			convMap[Lambda.indexOf(old.cases, p.a)] = conv;
-		}
-
-		function convertTypeRec( t : CustomType, v : Array<Dynamic> ) : Array<Dynamic> {
-			if( t == null )
-				return null;
-			if( t == old ) {
-				var conv = convMap[v[0]];
-				if( conv == null )
-					return null;
-				var out = conv.def.copy();
-				for( i in 0...conv.args.length ) {
-					var v = conv.args[i](v[i + 1]);
-					if( v == null ) continue;
-					out[v.index+1] = v.v;
-				}
-				return out;
-			}
-			var c = t.cases[v[0]];
-			for( i in 0...c.args.length ) {
-				switch( c.args[i].type ) {
-				case TCustom(tname):
-					var av = v[i + 1];
-					if( av != null )
-						v[i+1] = convertTypeRec(getCustomType(tname), av);
-				default:
-				}
-			}
-			return v;
 		}
 
 		// apply convert
@@ -884,24 +961,57 @@ class Database {
 				}
 	}
 
-	public function updateRefs( sheet : Sheet, refMap : Map <String, String> ) {
-		function convertTypeRec( t : CustomType, o : Array<Dynamic> ) {
-			var c = t.cases[o[0]];
-			for( i in 0...o.length - 1 ) {
-				var v : Dynamic = o[i + 1];
+	function convertTypeRec( sheet : Sheet, refMap : Map<String, String>, t : CustomType, o : Array<Dynamic> ) {
+		var c = t.cases[o[0]];
+		for( i in 0...o.length - 1 ) {
+			var v : Dynamic = o[i + 1];
+			if( v == null ) continue;
+			switch( c.args[i].type ) {
+			case TRef(n) if( n == sheet.name ):
+				var v = refMap.get(v);
 				if( v == null ) continue;
-				switch( c.args[i].type ) {
-				case TRef(n) if( n == sheet.name ):
-					var v = refMap.get(v);
-					if( v == null ) continue;
-					o[i + 1] = v;
-				case TCustom(name):
-					convertTypeRec(getCustomType(name), v);
-				default:
-				}
+				o[i + 1] = v;
+			case TCustom(name):
+				convertTypeRec(sheet, refMap, getCustomType(name), v);
+			default:
 			}
 		}
+	}
 
+	function replaceScriptIdent( v : String, oldId : String, newId : String ) {
+		return new EReg("\\b"+oldId.split(".").join("\\.")+"\\b","").replace(v, newId);
+	}
+
+	public function updateLocalRefs( sheet : Sheet, refMap : Map<String, String>, obj : Dynamic, objSheet : Sheet ) {
+		for( c in objSheet.columns ) {
+			var v : Dynamic = Reflect.field(obj, c.name);
+			if( v == null ) continue;
+			switch( c.type ) {
+			case TRef(n) if( n == sheet.name ):
+				v = refMap.get(v);
+				if( v == null ) continue;
+				Reflect.setField(obj, c.name, v);
+			case TCustom(t):
+				convertTypeRec(sheet, refMap, getCustomType(t), v);
+			case TList:
+				var sub = objSheet.getSub(c);
+				for( obj in (v:Array<Dynamic>) )
+					updateLocalRefs(sheet, refMap, obj, sub);
+			case TProperties:
+				updateLocalRefs(sheet, refMap, v, objSheet.getSub(c));
+			case TString if( c.kind == Script ):
+				var prefix = sheet.name.split("@").pop();
+				prefix = prefix.charAt(0).toUpperCase() + prefix.substr(1);
+				for( oldId => newId in refMap )
+					if( oldId != "" && newId != "" )
+						v = replaceScriptIdent(v,prefix+"."+oldId,prefix+"."+newId);
+				Reflect.setField(obj, c.name, v);
+			default:
+			}
+		}
+	}
+
+	public function updateRefs( sheet : Sheet, refMap : Map<String, String> ) {
 		for( s in sheets )
 			for( c in s.columns )
 				switch( c.type ) {
@@ -917,7 +1027,19 @@ class Database {
 					for( obj in s.getLines() ) {
 						var o = Reflect.field(obj, c.name);
 						if( o == null ) continue;
-						convertTypeRec(getCustomType(t), o);
+						convertTypeRec(sheet, refMap, getCustomType(t), o);
+					}
+				case TString if( c.kind == Script ):
+					var prefix = sheet.name.split("@").pop();
+					prefix = prefix.charAt(0).toUpperCase() + prefix.substr(1);
+					for( obj in s.getLines() ) {
+						var v : String = Reflect.field(obj, c.name);
+						if( v != null ) {
+							for( oldId => newId in refMap )
+								if( oldId != "" && newId != "" )
+									v = replaceScriptIdent(v,prefix+"."+oldId,prefix+"."+newId);
+							Reflect.setField(obj, c.name, v);
+						}
 					}
 				default:
 				}

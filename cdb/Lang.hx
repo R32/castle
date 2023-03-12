@@ -19,10 +19,16 @@ class Ref {
 
 class Lang {
 
+	public static var IGNORE_EXPORT_FIELD = "__ignoreLoc__";
+
 	var root : Data;
+	var dataSheets : Map<String,{ sheet : SheetData, idField : String, fields : Array<LocField>, refs : Map<String,Map<String,Ref>> }>;
+	var skipMissing : Bool;
+	public var missingSetLocKey : Bool;
 
 	public function new(root) {
 		this.root = root;
+		dataSheets = new Map();
 	}
 
 	public dynamic function onMissing( s : String ) {
@@ -86,12 +92,30 @@ class Lang {
 		for( s in root.sheets ) {
 			if( s.props.hide ) continue;
 			var x = xsheets.get(s.name);
+			if( s.props.dataFiles != null ) {
+				var fields = makeSheetFields(s);
+				if( fields.length > 0 ) {
+					var idField = null;
+					for( c in s.columns )
+						if( c.type == TId ) {
+							idField = c.name;
+							break;
+						}
+					if( idField == null )
+						continue; // sheet with no id not supported - should not have loc either
+					if( x == null ) {
+						onMissing("Missing sheet " + s.name);
+						continue;
+					}
+					dataSheets.set(s.name, { sheet : s, idField : idField, fields : fields, refs : makeIdMap(x) });
+				}
+				continue;
+			}
 			if( x == null ) {
 				if( s.lines.length > 0 && makeSheetFields(s).length > 0 )
 					onMissing("Missing sheet " + s.name);
 				continue;
 			}
-
 			var path = [s.name];
 			var outLines = [];
 			applySheet(path, s, makeSheetFields(s), s.lines, x, outLines);
@@ -109,6 +133,26 @@ class Lang {
 			deleteSheet(s, makeSheetFields(s), sdel, s.lines);
 		}
 	}
+
+	#if hide
+	public function applyPrefab( p : hrt.prefab.Prefab ) {
+		var t = p.getCdbType();
+		if( t != null ) {
+			var data = dataSheets.get(t);
+			if( data != null ) {
+				var o = p.props;
+				var id = Reflect.field(o, data.idField);
+				var path = [data.sheet.name, id];
+				var ref = data.refs.get(id);
+				var outSub = {};
+				for( f in data.fields )
+					applyRec(path, f, o, ref, outSub);
+			}
+		}
+		for( x in p )
+			applyPrefab(x);
+	}
+	#end
 
 	function deleteSheet( s : SheetData, loc : Array<LocField>, del : Array<{}>, lines : Array<Dynamic> ) {
 		var inf = getSheetHelpers(s);
@@ -158,11 +202,15 @@ class Lang {
 					var m = new Map();
 					for( e in e.elements() )
 						m.set(e.nodeName, new Ref(e));
-					byIndex[Std.parseInt(e.nodeName)] = m;
+					var name = e.nodeName;
+					if( StringTools.startsWith(name, "line") ) name = name.substr(4);
+					byIndex[Std.parseInt(name)] = m;
 				}
 				if( x.ref != null )
 					for( e in x.ref.elements() ) {
-						var m = byIndex[Std.parseInt(e.nodeName)];
+						var name = e.nodeName;
+						if( StringTools.startsWith(name, "line") ) name = name.substr(4);
+						var m = byIndex[Std.parseInt(name)];
 						if( m != null )
 							for( e in e.elements() ) {
 								var r = m.get(e.nodeName);
@@ -192,29 +240,11 @@ class Lang {
 
 		} else {
 
-			var byID = new Map();
-			if( x != null ) {
-				for( e in x.e.elements() ) {
-					var m = new Map();
-					for( e in e.elements() )
-						m.set(e.nodeName, new Ref(e));
-					byID.set(e.nodeName, m);
-				}
-				if( x.ref != null ) {
-					for( e in x.ref.elements() ) {
-						var m = byID.get(e.nodeName);
-						if( m != null )
-							for( e in e.elements() ) {
-								var r = m.get(e.nodeName);
-								if( r != null ) r.ref = e;
-							}
-					}
-				}
-			}
-
+			var byID = makeIdMap(x);
 			for( o in objects ) {
 				var outSub = {};
 				var id = Reflect.field(o, inf.id);
+				if( id == null ) id = "null";
 				path.push(id);
 				for( f in fields )
 					applyRec(path, f, o, byID.get(id), outSub);
@@ -227,14 +257,51 @@ class Lang {
 		}
 	}
 
-	function applyRec( path : Array<String>, f : LocField, o : Dynamic, data : Map<String,Ref>, out : Dynamic ) {
+	function makeIdMap( x : Ref ) {
+		var byID = new Map();
+		if( x == null )
+			return byID;
+		for( e in x.e.elements() ) {
+			var m = new Map();
+			for( e in e.elements() )
+				m.set(e.nodeName, new Ref(e));
+			byID.set(e.nodeName, m);
+		}
+		if( x.ref != null ) {
+			for( e in x.ref.elements() ) {
+				var m = byID.get(e.nodeName);
+				if( m != null )
+					for( e in e.elements() ) {
+						var r = m.get(e.nodeName);
+						if( r != null ) r.ref = e;
+					}
+			}
+		}
+		return byID;
+	}
+
+	function applyRec(path,f,o:Dynamic,data,out) {
+		var prevMissing = skipMissing;
+		if( Reflect.hasField(o, IGNORE_EXPORT_FIELD) )
+			skipMissing = true;
+		_applyRec(path,f,o,data,out);
+		skipMissing = prevMissing;
+	}
+
+	function _applyRec( path : Array<String>, f : LocField, o : Dynamic, data : Map<String,Ref>, out : Dynamic ) {
 		switch( f ) {
 		case LName(c):
 			var v = data == null ? null : data.get(c.name);
 			if( v != null ) {
-				var str = StringTools.htmlUnescape(#if (haxe_ver < 4) new haxe.xml.Fast #else new haxe.xml.Access #end(v.e).innerHTML);
-				var ref = v.ref == null ? null : StringTools.htmlUnescape(#if (haxe_ver < 4) new haxe.xml.Fast #else new haxe.xml.Access #end(v.ref).innerHTML);
-				if( ref != null && ref != Reflect.field(o,c.name) ) {
+				inline function unescape(x:Xml) {
+					var html = #if (haxe_ver < 4) new haxe.xml.Fast #else new haxe.xml.Access #end(x).innerHTML;
+					html = ~/<br\/>/gi.replace(html,"\n");
+					return StringTools.htmlUnescape(html);
+				}
+				var str = unescape(v.e);
+				var ref = v.ref == null ? null : unescape(v.ref);
+				var oname = Reflect.field(o,c.name);
+				if( ref != null && (oname == null || StringTools.trim(ref) != StringTools.trim(oname)) ) {
 					path.push(c.name);
 					onMissing("Ignored since has changed "+path.join("."));
 					path.pop();
@@ -243,10 +310,17 @@ class Lang {
 			} else {
 				var v = Reflect.field(o, c.name);
 				if( v != null && v != "" ) {
-					path.push(c.name);
-					Reflect.setField(out, c.name, v);
-					onMissing("Missing " + path.join("."));
-					path.pop();
+					if( !skipMissing ) {
+						path.push(c.name);
+						Reflect.setField(out, c.name, v);
+						onMissing("Missing " + path.join("."));
+						path.pop();
+					}
+					if( missingSetLocKey ) {
+						path.push(c.name);
+						Reflect.setField(o, c.name, "#"+path.join("."));
+						path.pop();
+					}
 				}
 			}
 		case LSingle(c, f):
@@ -301,8 +375,10 @@ class Lang {
 	function getLocText( tabs : String, o : Dynamic, f : LocField, diff : LangDiff ) {
 		switch( f ) {
 		case LName(c):
-			var v = Reflect.field(o, c.name);
-			return { name : c.name, value : v == null ? v : StringTools.htmlEscape(v) };
+			var v : String = Reflect.field(o, c.name);
+			if( v != null )
+				v = StringTools.htmlEscape(v).split("\n").join("<br/>").split("\r").join("");
+			return { name : c.name, value : v };
 		case LSingle(c, f):
 			var v = getLocText(tabs, Reflect.field(o, c.name), f, diff);
 			return { name : c.name+"." + v.name, value : v.value };
@@ -318,7 +394,8 @@ class Lang {
 		var helpers = [];
 		for( c in s.columns ) {
 			switch( c.type ) {
-			case TId if( id == null ): id = c;
+			case TId if( id == null ):
+				id = c;
 			case TRef(sheet):
 				var map = null;
 				var s = getSheet(sheet);
@@ -346,19 +423,29 @@ class Lang {
 			}
 		}
 		if( id != null ) helpers = [];
-		return { id : id == null ? null : id.name, helpers : helpers };
+		return { id : id == null ? null : id.name, idOpt : id == null ? false : id.opt, helpers : helpers };
 	}
 
 	function buildSheetXml(s:SheetData, tabs, values : Array<Dynamic>, locFields:Array<LocField>, diff : Map<String,Array<{}>> ) {
 		var inf = getSheetHelpers(s);
-		var id = inf.id;
 		var buf = new StringBuf();
 		var index = 0;
 		for( o in values ) {
-			var id = id == null ? ""+(index++) : Reflect.field(o, id);
-			if( id == null || id == "" ) continue;
 
-			var locs = [for( f in locFields ) getLocText(tabs, o, f, diff)];
+			if( Reflect.hasField(o, IGNORE_EXPORT_FIELD) ) continue;
+
+			var id;
+			if( inf.id == null )
+				id = "line"+(index++);
+			else {
+				id = Reflect.field(o, inf.id);
+				if( id == "" ) continue;
+				if( id == null ) {
+					if( !inf.idOpt ) continue;
+					id = "null";
+				}
+			}
+			var locs = [for( f in locFields ) { var l = getLocText(tabs, o, f, diff); { f : f, value : l.value, name : l.name }; }];
 			var hasLoc = false;
 			for( l in locs )
 				if( l.value != null && l.value != "" ) {
@@ -380,7 +467,7 @@ class Lang {
 			buf.add('>\n');
 			for( l in locs )
 				if( l.value != null && l.value != "" ) {
-					if( l.value.indexOf("<") < 0 )
+					if( l.f.match(LName(_)) || l.value.indexOf("<") < 0 )
 						buf.add('$tabs\t<${l.name}>${l.value}</${l.name}>\n');
 					else {
 						buf.add('$tabs\t<${l.name}>\n');

@@ -67,6 +67,8 @@ class Module {
 	#end
 
 	static function getSheetLines( sheets : Array<Data.SheetData>, s : Data.SheetData ) {
+		if( s.props.dataFiles != null )
+			return [];
 		if( !s.props.hide )
 			return s.lines;
 		var name = s.name.split("@");
@@ -124,6 +126,28 @@ class Module {
 		if( typeName != null ) modName = typeName;
 
 		var typesCache = new Map<String,String>();
+		var hsheets = new Map();
+		for( s in data.sheets )
+			hsheets.set(s.name, s);
+
+		var defineEnums = new Map<String,String>();
+
+		function makeEnum( c : Data.Column, tname : String, values : Array<String> ) {
+			var key = c.name+":"+values.join("|");
+			var prev = defineEnums.get(key);
+			if( prev != null ) {
+				types.push({
+					name : tname,
+					pack : curMod,
+					kind : TDAlias(prev.toComplex()),
+					pos : pos,
+					fields : [],
+				});
+				return;
+			}
+			types.push(makeFakeEnum(tname,curMod,pos,values));
+			defineEnums.set(key, tname);
+		}
 
 		for( s in data.sheets ) {
 			var tname = makeTypeName(s.name);
@@ -133,6 +157,9 @@ class Module {
 			var realFields : Array<haxe.macro.Expr.Field> = [];
 			var ids : Array<haxe.macro.Expr.Field> = [];
 			for( c in s.columns ) {
+
+				if( c.kind == Hidden ) continue;
+
 				var t = switch( c.type ) {
 				case TInt, TColor: macro : Int;
 				case TFloat: macro : Float;
@@ -147,13 +174,13 @@ class Module {
 					tkind.toComplex();
 				case TEnum(values):
 					var t = makeTypeName(s.name + "@" + c.name);
-					types.push(makeFakeEnum(t,curMod,pos,values));
+					makeEnum(c,t,values);
 					t.toComplex();
 				case TCustom(name):
 					name.toComplex();
 				case TFlags(values):
 					var t = makeTypeName(s.name + "@" + c.name);
-					types.push(makeFakeEnum(t, curMod, pos, values));
+					makeEnum(c,t,values);
 					var t = t.toComplex();
 					macro : cdb.Types.Flags<$t>;
 				case TLayer(t):
@@ -171,10 +198,12 @@ class Module {
 				}
 
 				var rt = switch( c.type ) {
-				case TInt, TEnum(_), TFlags(_), TColor: macro : Int;
+				case TInt, TColor: macro : Int;
 				case TFloat: macro : Float;
 				case TBool: macro : Bool;
-				case TString, TRef(_), TImage, TId, TFile: macro : String;
+				case TString, TImage, TId, TFile: macro : String;
+				case TEnum(_), TFlags(_): t; // allow safe type def build
+				case TRef(t): makeTypeName(t+"Kind").toComplex();
 				case TCustom(_): macro : Array<Dynamic>;
 				case TList:
 					var t = (makeTypeName(s.name+"@"+c.name) + "Def").toComplex();
@@ -217,14 +246,17 @@ class Module {
 						idField = c.name;
 
 					var cname = c.name;
+					var idMap = new Map();
 					for( obj in getSheetLines(data.sheets,s) ) {
 						var id = Reflect.field(obj, cname);
-						if( id != null && id != "" )
+						if( id != null && id != "" && (c.scope == null || !idMap.exists(id)) ) {
 							ids.push({
 								name : id,
 								pos : pos,
 								kind : FVar(null,macro $v{id}),
 							});
+							idMap.set(id, true);
+						}
 					}
 
 					fields.push({
@@ -250,21 +282,25 @@ class Module {
 						}),
 						access : [AInline,APrivate],
 					});
-				case TRef(s):
+				case TRef(ref):
 					var cname = c.name;
-					var fname = fieldName(s);
-					fields.push({
-						name : "get_"+c.name,
-						pos : pos,
-						kind : FFun({
-							ret : t,
-							args : [],
-							expr : c.opt ? macro return $i{modName}.$fname.resolve(this.$cname) : macro return this.$cname == null ? null : $i{modName}.$fname.resolve(this.$cname),
-						}),
-						access : [APrivate],
-					});
+					var fname = fieldName(ref);
+					if( ref.indexOf('@') < 0 && hsheets.get(ref).props.dataFiles == null )
+						fields.push({
+							name : "get_"+c.name,
+							pos : pos,
+							kind : FFun({
+								ret : t,
+								args : [],
+								expr : c.opt ? macro return $i{modName}.$fname.resolve(this.$cname.toString()) : macro return this.$cname == null ? null : $i{modName}.$fname.resolve(this.$cname.toString()),
+							}),
+							access : [APrivate],
+						});
+					else
+						fields.pop(); // no field access
+
 					// allow direct id access (no fetch)
-					var tid = (makeTypeName(s) + "Kind").toComplex();
+					var tid = (makeTypeName(ref) + "Kind").toComplex();
 					if( c.opt ) tid = macro : Null<$tid>;
 					fields.push( {
 						name : c.name + "Id",
@@ -300,6 +336,7 @@ class Module {
 					name : c.name,
 					pos : pos,
 					kind : FVar(rt),
+					meta : c.opt ? [{ name : ":optional", pos : pos }] : [],
 				});
 			}
 
@@ -315,27 +352,18 @@ class Module {
 				});
 			}
 
-			var gtitles = s.props.separatorTitles;
-			if( s.props.hasGroup && gtitles != null ) {
+			if( s.props.hasGroup ) {
 				var tint = macro : Int;
 				realFields.push( { name : "group", pos : pos, kind : FVar(tint) } );
 				var tgroup = makeTypeName(s.name + "@group");
-				var groups = [for( t in gtitles ) if( t != null ) makeTypeName(t)];
+				var groups = [for( t in s.separators ) if( t.title != null ) makeTypeName(t.title)];
 				var needNone = false;
 				// check if we have items without a separator
-				if( gtitles[0] == null )
-					needNone = true;
-				else if( s.separators != null )
-					needNone = s.separators[0] > 0;
-				else {
-					var ids : Array<Dynamic> = Reflect.field(s, "separatorIds");
-					var fid = ids[0];
-					if( Std.is(fid,Int) ) {
-						needNone = fid > 0;
-					} else
-						needNone = fid != Reflect.field(s.lines[0],idField);
+				if( s.separators.length > 0 ) {
+					var s0 = s.separators[0];
+					if( s0.title == null || s0.index > 0 || (s0.id != null && s0.id != Reflect.field(s.lines[0],idField)) )
+						needNone = true;
 				}
-
 				if( needNone )
 					groups.unshift("None");
 				types.push(makeFakeEnum(tgroup, curMod, pos, groups));
@@ -505,7 +533,7 @@ class Module {
 
 		var assigns = [], fields = new Array<haxe.macro.Expr.Field>();
 		for( s in data.sheets ) {
-			if( s.props.hide ) continue;
+			if( s.props.hide || s.props.dataFiles != null ) continue;
 			var tname = makeTypeName(s.name);
 			var t = tname.toComplex();
 			var fname = fieldName(s.name);
@@ -517,7 +545,7 @@ class Module {
 					access : [APublic, AStatic],
 					kind : FVar(macro : cdb.Types.IndexId<$t,$kind>),
 				});
-				assigns.push(macro $i { fname } = new cdb.Types.IndexId(root, $v { s.name } ));
+				assigns.push(macro if( allowReload && $i{fname} != null ) @:privateAccess $i{fname}.reload(root) else $i{fname} = new cdb.Types.IndexId(root, $v{s.name}));
 			} else {
 				fields.push({
 					name : fname,
@@ -525,7 +553,7 @@ class Module {
 					access : [APublic, AStatic],
 					kind : FVar(macro : cdb.Types.Index<$t>),
 				});
-				assigns.push(macro $i { fname } = new cdb.Types.Index(root, $v { s.name } ));
+				assigns.push(macro $i{ fname } = new cdb.Types.Index(root, $v{ s.name }));
 			}
 		}
 		types.push({
@@ -540,7 +568,7 @@ class Module {
 					if( onMissing != null ) c.onMissing = onMissing;
 					return c.apply(xml,reference);
 				}
-				public static function load( content : String ) {
+				public static function load( content : String, allowReload = false ) {
 					root = cdb.Parser.parse(content, false);
 					{$a{assigns}};
 				}

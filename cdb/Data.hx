@@ -36,21 +36,16 @@ enum ColumnType {
 	TProperties;
 }
 
-#if macro
-typedef DisplayType = Int;
-typedef ColumnKind = String;
-#else
-@:enum
-abstract DisplayType(Int) {
+@:enum abstract DisplayType(Int) {
 	var Default = 0;
 	var Percent = 1;
 }
-@:enum
-abstract ColumnKind(String) {
+
+@:enum abstract ColumnKind(String) {
 	var Localizable = "localizable";
 	var Script = "script";
+	var Hidden = "hidden";
 }
-#end
 
 typedef Column = {
 	var name : String;
@@ -59,6 +54,9 @@ typedef Column = {
 	@:optional var opt : Bool;
 	@:optional var display : DisplayType;
 	@:optional var kind : ColumnKind;
+	@:optional var scope : Int;
+	@:optional var documentation : String;
+	@:optional var editor : Any;
 }
 
 @:enum abstract LayerMode(String) {
@@ -117,12 +115,21 @@ typedef LevelsProps = {
 typedef SheetProps = {
 	@:optional var displayColumn : Null<String>;
 	@:optional var displayIcon : Null<String>;
-	@:optional var separatorTitles : Array<String>;
 	@:optional var hide : Bool;
 	@:optional var isProps : Bool;
 	@:optional var hasIndex : Bool;
 	@:optional var hasGroup : Bool;
 	@:optional var level : LevelsProps;
+	@:optional var dataFiles : String;
+	@:optional var editor : Any;
+}
+
+typedef Separator = {
+	var ?index : Int;
+	var ?id : String;
+	var ?title : String;
+	var ?level : Int;
+	var ?path : String;
 }
 
 typedef SheetData = {
@@ -130,7 +137,8 @@ typedef SheetData = {
 	var columns : Array<Column>;
 	var lines : Array<Dynamic>;
 	var props : SheetProps;
-	var separators : Array<Int>;
+	var separators : Array<Separator>;
+	@:optional var linesData : Array<Dynamic>;
 }
 
 typedef CustomTypeCase = {
